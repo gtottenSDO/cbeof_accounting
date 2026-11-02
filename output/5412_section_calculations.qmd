@@ -1,0 +1,425 @@
+---
+title: "Accounting and Payroll Services (NAICS 5412): CBEOF 2026 section calculations"
+subtitle: "Every number in the draft section, computed from source data"
+author: "Greg Totten"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+    df-print: kable
+execute:
+  warning: false
+  message: false
+---
+
+## How this notebook works
+
+This notebook pulls or reads every source the section uses, computes each figure, and writes the section text with **inline R**, so the text always matches the data. The [audit table](#audit-table) at the end lists every number with its calculation and source.
+
+**Raw data and caching**
+
+- Downloaded data (BLS QCEW, Census QWI) is saved to `inputs/raw/` on the first render and reused after that, so later renders are reproducible.
+- To refresh a source, delete its file in `inputs/raw/` and render again.
+
+**Needs**
+
+- Packages: `openxlsx2`, `jsonlite`, `knitr`.
+- A Census API key in `CENSUS_API_KEY`, used only on a first or refreshed QWI pull.
+- Local files in `inputs/`:
+  - `5412_Data_Run.xlsx` (Lightcast industry table)
+  - `5412_Job_Posting_Data.xlsx` (Lightcast job postings)
+  - `occproj__2025LT002035.csv` (CDLE LMI 2025–2035 long-term occupational projections)
+
+Render from this folder with `quarto render 5412_section_calculations.qmd`.
+
+```{r setup}
+library(openxlsx2)
+library(jsonlite)
+
+inputs  <- file.path("..", "inputs")
+raw_dir <- file.path(inputs, "raw")
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+
+lightcast_industry <- file.path(inputs, "5412_Data_Run.xlsx")
+lightcast_postings <- file.path(inputs, "5412_Job_Posting_Data.xlsx")
+lmi_projections    <- file.path(inputs, "occproj__2025LT002035.csv")
+stopifnot(file.exists(lightcast_industry), file.exists(lightcast_postings), file.exists(lmi_projections))
+
+# ---- formatting helpers used in the inline text ----
+pct    <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)          # 0.025 -> "2.5%"
+pct_ab <- function(x, d = 1) pct(abs(x), d)                                      # size of a decline
+num    <- function(x) format(round(x), big.mark = ",", scientific = FALSE, trim = TRUE)
+usd    <- function(x, to = 1) paste0("$", num(round(x / to) * to))
+nearly <- function(x, to = 100) paste("nearly", num(ceiling(x / to) * to))
+
+# ---- arithmetic helpers ----
+cagr <- function(v0, v1, years) (v1 / v0)^(1 / years) - 1
+chg  <- function(v0, v1) v1 / v0 - 1
+
+# ---- cache: fetch once, save as CSV in inputs/raw/, reuse afterwards ----
+code_cols <- c("area_fips", "industry_code", "industry", "agegrp", "time", "disclosure_code")
+cached <- function(name, fetch) {
+  path <- file.path(raw_dir, name)
+  if (!file.exists(path)) write.csv(fetch(), path, row.names = FALSE)
+  d <- read.csv(path, colClasses = "character")
+  for (v in setdiff(names(d), code_cols)) d[[v]] <- as.numeric(d[[v]])
+  d
+}
+```
+
+## 1. Employment trends (BLS QCEW)
+
+**Source:** BLS Quarterly Census of Employment and Wages (QCEW) open data, Colorado statewide (area 08000).
+
+**Ownership:**
+- NAICS 5412, 54 and the 6-digit industries are private ownership (`own_code` 5).
+- "Colorado overall" is total covered employment, all ownerships (`own_code` 0).
+
+```{r qcew-annual}
+qcew_area <- function(year, period) {
+  read.csv(sprintf("https://data.bls.gov/cew/data/api/%d/%s/area/08000.csv", year, period),
+           colClasses = c(area_fips = "character", industry_code = "character"))
+}
+keep_series <- function(d) {
+  d[(d$own_code == 0 & d$industry_code == "10") |
+    (d$own_code == 5 & d$industry_code %in% c("54", "5412", "541211", "541213", "541214", "541219")), ]
+}
+
+ann <- do.call(rbind, lapply(c(2015, 2024, 2025), function(y) cached(
+  sprintf("qcew_annual_CO_%d.csv", y),
+  function() keep_series(qcew_area(y, "a"))[, c("year", "own_code", "industry_code", "annual_avg_estabs",
+                                               "annual_avg_emplvl", "annual_avg_wkly_wage", "disclosure_code")])))
+
+emp_a <- function(own, ind, y) {
+  v <- ann$annual_avg_emplvl[ann$own_code == own & ann$industry_code == ind & ann$year == y]
+  stopifnot(length(v) == 1); v
+}
+
+e5412_15 <- emp_a(5, "5412", 2015); e5412_24 <- emp_a(5, "5412", 2024); e5412_25 <- emp_a(5, "5412", 2025)
+cagr_5412 <- cagr(e5412_15, e5412_25, 10)
+cagr_pst  <- cagr(emp_a(5, "54", 2015), emp_a(5, "54", 2025), 10)
+cagr_co   <- cagr(emp_a(0, "10", 2015), emp_a(0, "10", 2025), 10)
+chg25_5412 <- chg(e5412_24, e5412_25)
+chg25_pst  <- chg(emp_a(5, "54", 2024), emp_a(5, "54", 2025))
+chg25_co   <- chg(emp_a(0, "10", 2024), emp_a(0, "10", 2025))
+cpa_share_25 <- emp_a(5, "541211", 2025) / e5412_25
+
+data.frame(series = c("5412 (private)", "PST 54 (private)", "Colorado total (all ownerships)", "CPA offices 541211 (private)"),
+           emp_2015 = c(e5412_15, emp_a(5, "54", 2015), emp_a(0, "10", 2015), emp_a(5, "541211", 2015)),
+           emp_2024 = c(e5412_24, emp_a(5, "54", 2024), emp_a(0, "10", 2024), emp_a(5, "541211", 2024)),
+           emp_2025 = c(e5412_25, emp_a(5, "54", 2025), emp_a(0, "10", 2025), emp_a(5, "541211", 2025)),
+           cagr_2015_25 = pct(c(cagr_5412, cagr_pst, cagr_co, cagr(emp_a(5, "541211", 2015), emp_a(5, "541211", 2025), 10))),
+           chg_2024_25  = pct(c(chg25_5412, chg25_pst, chg25_co, chg(emp_a(5, "541211", 2024), emp_a(5, "541211", 2025)))))
+```
+
+**First quarter 2026 vs first quarter 2025.**
+- QCEW isn't seasonally adjusted, so the comparison is same quarter to same quarter.
+- Quarterly employment is the average of the three monthly counts.
+
+```{r qcew-q1}
+q1 <- do.call(rbind, lapply(c(2025, 2026), function(y) cached(
+  sprintf("qcew_q1_CO_%d.csv", y),
+  function() keep_series(qcew_area(y, "1"))[, c("year", "qtr", "own_code", "industry_code", "qtrly_estabs",
+                                               "month1_emplvl", "month2_emplvl", "month3_emplvl", "disclosure_code")])))
+q1$emp <- (q1$month1_emplvl + q1$month2_emplvl + q1$month3_emplvl) / 3
+q_val <- function(own, ind, y, var = "emp") {
+  v <- q1[[var]][q1$own_code == own & q1$industry_code == ind & q1$year == y]
+  stopifnot(length(v) == 1); v
+}
+
+q1chg_5412    <- chg(q_val(5, "5412", 2025),   q_val(5, "5412", 2026))
+q1chg_cpa     <- chg(q_val(5, "541211", 2025), q_val(5, "541211", 2026))
+q1chg_cpa_est <- chg(q_val(5, "541211", 2025, "qtrly_estabs"), q_val(5, "541211", 2026, "qtrly_estabs"))
+q1chg_pay     <- chg(q_val(5, "541214", 2025), q_val(5, "541214", 2026))
+# CPA offices' share of the industry's Q1 job loss ("account for most of the recent decline")
+cpa_share_of_q1_loss <- (q_val(5, "541211", 2025) - q_val(5, "541211", 2026)) /
+                        (q_val(5, "5412", 2025)   - q_val(5, "5412", 2026))
+
+data.frame(series = c("5412", "CPA offices (541211)", "Payroll services (541214)", "PST (54)", "Colorado total"),
+           q1_2025 = num(c(q_val(5, "5412", 2025), q_val(5, "541211", 2025), q_val(5, "541214", 2025), q_val(5, "54", 2025), q_val(0, "10", 2025))),
+           q1_2026 = num(c(q_val(5, "5412", 2026), q_val(5, "541211", 2026), q_val(5, "541214", 2026), q_val(5, "54", 2026), q_val(0, "10", 2026))),
+           change  = pct(c(q1chg_5412, q1chg_cpa, q1chg_pay, chg(q_val(5, "54", 2025), q_val(5, "54", 2026)), chg(q_val(0, "10", 2025), q_val(0, "10", 2026)))))
+```
+
+**Payroll services (541214), Colorado vs US.** This uses the QCEW industry file, which contains every area.
+
+```{r payroll-us}
+pay <- do.call(rbind, lapply(c(2015, 2024, 2025), function(y) cached(
+  sprintf("qcew_annual_541214_CO_US_%d.csv", y),
+  function() {
+    d <- read.csv(sprintf("https://data.bls.gov/cew/data/api/%d/a/industry/541214.csv", y),
+                  colClasses = c(area_fips = "character", industry_code = "character"))
+    d[d$area_fips %in% c("08000", "US000") & d$own_code == 5,
+      c("year", "area_fips", "own_code", "industry_code", "annual_avg_emplvl", "disclosure_code")]
+  })))
+pay_emp <- function(area, y) { v <- pay$annual_avg_emplvl[pay$area_fips == area & pay$year == y]; stopifnot(length(v) == 1); v }
+
+cagr_pay_co <- cagr(pay_emp("08000", 2015), pay_emp("08000", 2025), 10)
+cagr_pay_us <- cagr(pay_emp("US000", 2015), pay_emp("US000", 2025), 10)
+pay_ratio   <- cagr_pay_co / cagr_pay_us          # "more than double the national rate" requires > 2
+pay_emp_25  <- pay_emp("08000", 2025)
+chg25_pay   <- chg(pay_emp("08000", 2024), pay_emp("08000", 2025))
+
+data.frame(area = c("Colorado", "United States"),
+           emp_2015 = num(c(pay_emp("08000", 2015), pay_emp("US000", 2015))),
+           emp_2025 = num(c(pay_emp("08000", 2025), pay_emp("US000", 2025))),
+           cagr_2015_25 = pct(c(cagr_pay_co, cagr_pay_us)),
+           co_to_us_ratio = c(round(pay_ratio, 2), NA))
+```
+
+US payroll services employment fell by about 30,000 in a single step in January 2025, which is likely a reclassification. The text therefore uses only the 10-year US rate, not the 2025 US change.
+
+## 2. Workforce age, hiring and separations (Census QWI)
+
+**Source:** Census Quarterly Workforce Indicators (QWI), Colorado, private ownership (A05), both sexes, not seasonally adjusted.
+
+**Coverage:** QWI industry detail stops at 4-digit NAICS, so these figures cover 5412 as a whole.
+
+**Measures used:**
+- `Emp`: beginning-of-quarter employment.
+- `Sep`: separations. Blank in the latest quarter.
+- `FrmJbGn`: firm job gains, computed within each age group. Blank in the latest quarter.
+- `HirN`: new hires (excludes recalls).
+
+**Age groups:**
+
+| Code | Ages |
+|---|---|
+| A03 | 22–24 |
+| A04 | 25–34 |
+| A07 | 55–64 |
+| A08 | 65+ |
+| A00 | All ages |
+
+```{r qwi}
+qwi_vars <- c("Emp", "HirA", "HirN", "Sep", "FrmJbGn", "FrmJbLs")
+qwi_pull <- function(ind) {
+  if (!nzchar(Sys.getenv("CENSUS_API_KEY"))) stop("Set CENSUS_API_KEY to pull QWI.")
+  u <- paste0("https://api.census.gov/data/timeseries/qwi/sa?get=", paste(qwi_vars, collapse = ","), ",agegrp",
+              "&for=state:08&ownercode=A05&sex=0&seasonadj=U&time=from+2015-Q1+to+2025-Q4",
+              if (ind != "00") paste0("&industry=", ind) else "",
+              "&key=", Sys.getenv("CENSUS_API_KEY"))
+  r <- fromJSON(u); d <- as.data.frame(r[-1, , drop = FALSE]); names(d) <- r[1, ]
+  d$industry <- ind
+  d[order(d$agegrp, d$time), c("industry", "time", "agegrp", qwi_vars)]   # the API key is not saved
+}
+qwi <- rbind(cached("qwi_CO_5412.csv", function() qwi_pull("5412")),
+             cached("qwi_CO_all_industries.csv", function() qwi_pull("00")))
+qwi$year <- substr(qwi$time, 1, 4)
+
+# average employment in a year (4 quarters) summed over the age groups given
+avg_emp <- function(ind, ages, y) {
+  d <- qwi[qwi$industry == ind & qwi$agegrp %in% ages & qwi$year == y, ]
+  stopifnot(length(unique(d$time)) == 4, !anyNA(d$Emp)); sum(d$Emp) / 4
+}
+# separations / employment over a four-quarter window (average quarterly rate)
+sep_rate <- function(ind, age, from, to) {
+  d <- qwi[qwi$industry == ind & qwi$agegrp == age & qwi$time >= from & qwi$time <= to, ]
+  stopifnot(nrow(d) == 4, !anyNA(d$Sep)); sum(d$Sep) / sum(d$Emp)
+}
+# annual total of a flow (all four quarters required)
+flow_sum <- function(ind, age, y, var) {
+  d <- qwi[qwi$industry == ind & qwi$agegrp == age & qwi$year == y, ]
+  stopifnot(nrow(d) == 4, !anyNA(d[[var]])); sum(d[[var]])
+}
+
+chg_2224     <- chg(avg_emp("5412", "A03", "2023"), avg_emp("5412", "A03", "2025"))
+chg_2534     <- chg(avg_emp("5412", "A04", "2023"), avg_emp("5412", "A04", "2025"))
+chg_55p      <- chg(avg_emp("5412", c("A07", "A08"), "2023"), avg_emp("5412", c("A07", "A08"), "2025"))
+chg_2224_all <- chg(avg_emp("00", "A03", "2023"), avg_emp("00", "A03", "2025"))
+chg_2534_all <- chg(avg_emp("00", "A04", "2023"), avg_emp("00", "A04", "2025"))
+
+# Separation rates: four quarters ending Q3 (the last quarter with separations data)
+sep_2224_23 <- sep_rate("5412", "A03", "2022-Q4", "2023-Q3"); sep_2224_25 <- sep_rate("5412", "A03", "2024-Q4", "2025-Q3")
+sep_2534_23 <- sep_rate("5412", "A04", "2022-Q4", "2023-Q3"); sep_2534_25 <- sep_rate("5412", "A04", "2024-Q4", "2025-Q3")
+
+# Firm job gains within the 25-34 group, 2022 vs 2024 (2025 Q4 is blank)
+fjg_2534_chg <- chg(flow_sum("5412", "A04", "2022", "FrmJbGn"), flow_sum("5412", "A04", "2024", "FrmJbGn"))
+fjg_all_chg  <- chg(flow_sum("5412", "A00", "2022", "FrmJbGn"), flow_sum("5412", "A00", "2024", "FrmJbGn"))
+hirn_2534_chg <- chg(flow_sum("5412", "A04", "2022", "HirN"), flow_sum("5412", "A04", "2024", "HirN"))
+
+data.frame(measure = c("Employment 22-24, 2023 to 2025", "Employment 25-34, 2023 to 2025", "Employment 55+, 2023 to 2025",
+                       "All industries: employment 22-24", "All industries: employment 25-34",
+                       "Separation rate 22-24 (Q4'22-Q3'23 to Q4'24-Q3'25)", "Separation rate 25-34 (same windows)",
+                       "Firm job gains, 25-34, 2022 to 2024", "Firm job gains, all ages, 2022 to 2024", "New hires 25-34, 2022 to 2024"),
+           value = c(pct(chg_2224), pct(chg_2534), pct(chg_55p), pct(chg_2224_all), pct(chg_2534_all),
+                     paste(pct(sep_2224_23), "to", pct(sep_2224_25)), paste(pct(sep_2534_23), "to", pct(sep_2534_25)),
+                     pct(fjg_2534_chg), pct(fjg_all_chg), pct(hirn_2534_chg)))
+```
+
+## 3. Earnings and job postings (Lightcast)
+
+**Source:** Lightcast Q4 2026 data set (exports in `inputs/`).
+
+**Earnings:** wages, salaries and proprietor earnings per job, excluding supplements.
+
+**Postings:**
+- Newly posted unique postings, Oct 2025–Sep 2026.
+- The industry filter is NAICS 5412, Colorado.
+
+```{r lightcast}
+# Read a Lightcast sheet whose header row contains `header_label` (sheets have title rows above the header)
+read_lc <- function(file, sheet_pattern, header_label) {
+  sh <- grep(sheet_pattern, wb_get_sheet_names(wb_load(file)), value = TRUE)[1]
+  x  <- wb_to_df(file, sheet = sh, col_names = FALSE)
+  h  <- which(apply(x, 1, function(r) header_label %in% r))[1]
+  d  <- x[(h + 1):nrow(x), , drop = FALSE]
+  names(d) <- as.character(unlist(x[h, ]))
+  d <- d[, !is.na(names(d)) & names(d) != "NA", drop = FALSE]
+  rownames(d) <- NULL
+  d
+}
+as_num <- function(v) suppressWarnings(as.numeric(v))
+
+# Industry table: the total row has the largest job count
+lc  <- read_lc(lightcast_industry, "^Colorado$", "NAICS")
+tot <- lc[which.max(as_num(lc[["2025 Jobs"]])), ]
+earn_24 <- as_num(tot[["2024 Wages, Salaries, & Proprietor Earnings"]])
+earn_25 <- as_num(tot[["2025 Wages, Salaries, & Proprietor Earnings"]])
+earn_chg <- chg(earn_24, earn_25)
+stopifnot(abs(as_num(tot[["2025 Jobs"]]) - e5412_25) < 5)   # Lightcast total should match QCEW 2025
+
+# Postings by occupation
+occ  <- read_lc(lightcast_postings, "^Postings by Occupation", "SOC")
+pcol <- grep("^Unique Postings", names(occ), value = TRUE)[1]
+occ  <- occ[!is.na(as_num(occ[[pcol]])), ]
+occ_total_row <- occ[is.na(occ$SOC) & grepl("^Total", occ$Occupation), ]   # sheet's own total row
+occ  <- occ[!is.na(occ$SOC), ]
+post_total <- as_num(occ_total_row[[pcol]])
+stopifnot(length(post_total) == 1, post_total == sum(as_num(occ[[pcol]])))   # total row = sum of occupations
+post_cm    <- sum(as_num(occ[[pcol]][startsWith(occ$SOC, "15-")]))   # computer and mathematical (SOC 15-)
+post_acct  <- as_num(occ[[pcol]][occ$SOC == "13-2011"])
+
+# Skills: artificial intelligence
+sk   <- read_lc(lightcast_postings, "^Specialized Skills", "Skill or Qualification")
+scol <- grep("^Unique Postings", names(sk), value = TRUE)[1]
+post_ai <- as_num(sk[[scol]][sk[["Skill or Qualification"]] == "Artificial Intelligence"])
+
+# Companies: payroll technology firms
+co   <- read_lc(lightcast_postings, "^By Company", "Company")
+ccol <- grep("^Unique Postings", names(co), value = TRUE)[1]
+payroll_tech <- c("UKG", "Gusto", "ADP")
+post_paytech <- sum(as_num(co[[ccol]][co$Company %in% payroll_tech]))
+stopifnot(all(payroll_tech %in% co$Company))
+
+data.frame(measure = c("Avg earnings per job 2024", "Avg earnings per job 2025", "Change",
+                       "Unique postings (total)", "Computer & math (SOC 15-)", "Accountants & auditors (13-2011)",
+                       "Postings listing Artificial Intelligence", "UKG + Gusto + ADP postings"),
+           value = c(usd(earn_24), usd(earn_25), pct(earn_chg), num(post_total),
+                     paste0(num(post_cm), " (", pct(post_cm / post_total), ")"),
+                     paste0(num(post_acct), " (", pct(post_acct / post_total), ")"),
+                     paste0(num(post_ai), " (", pct(post_ai / post_total), ")"),
+                     num(post_paytech)))
+```
+
+## 4. Occupational projections (CDLE LMI, 2025–2035)
+
+**Source:** Colorado Department of Labor and Employment, Labor Market Information, long-term occupational projections, 2025–2035, statewide. The raw file is `inputs/occproj__2025LT002035.csv`.
+
+```{r lmi}
+lmi <- read.csv(lmi_projections, colClasses = "character")
+lmi_occ <- function(code) {
+  d <- lmi[lmi$areaname == "Colorado" & lmi$occcode == code, ]; stopifnot(nrow(d) == 1)
+  data.frame(occupation = d$codeTitle, emp_2025 = as.numeric(d$estoccprj), emp_2035 = as.numeric(d$projoccprj),
+             pct_change = as.numeric(d$pchg) / 100, annual_openings = as.numeric(d$annualopenings))
+}
+proj <- do.call(rbind, lapply(c("132011", "433031", "132082", "433051"), lmi_occ))
+pay_clerk_chg <- proj$pct_change[proj$occupation == "Payroll and Timekeeping Clerks"]
+transform(proj, pct_change = pct(pct_change))
+```
+
+## 5. Facts cited from outside sources (not computed here)
+
+These are stated as reported. Check them against the source before publishing.
+
+```{r cited}
+cited <- data.frame(
+  claim = c("Roughly a quarter of the 100 largest CPA firms are PE-backed, including Richey May",
+            "Young workers (22-25) in AI-exposed occupations are 19% below trend",
+            "Accountants and auditors: Tier 1 Top Job, 3,793 annual openings through 2034",
+            "SB26-076 pathways begin January 1, 2027",
+            "Paychex acquired Paycor for $4.1 billion"),
+  source = c("CFO Brew, Apr 30, 2026 (about 24 of the Top 100)",
+             "Stanford Digital Economy Lab, Canaries in the Coal Mine, revised Aug 12, 2026",
+             "CWDC, 2025 Colorado Talent Pipeline Report (uses the 2024-34 projections)",
+             "SB26-076; Board of Accountancy rules adopted Oct 21, 2026 (COCPA, Oct 23, 2026)",
+             "Constellation Research, Jan 7, 2025"))
+cited
+```
+
+## 6. Section text (live)
+
+Every number below is computed above; nothing in this text is typed by hand. The external facts listed in section 5 are the exception.
+
+---
+
+### Accounting and Payroll Services
+
+Accounting and Payroll Services employment grew at a compound annual rate of `r pct(cagr_5412)` between 2015 and 2025, faster than Colorado overall (`r pct(cagr_co)`) but slower than the PST sector as a whole (`r pct(cagr_pst)`). That growth has since reversed. Employment fell `r pct_ab(chg25_5412)` in 2025 to `r num(e5412_25)`, a steeper decline than for PST (`r pct(chg25_pst)`) or the state (`r pct(chg25_co)`), and first-quarter 2026 employment was `r pct_ab(q1chg_5412)` below a year earlier. Average annual earnings per job rose `r pct(earn_chg)` in 2025 to about `r usd(earn_25, 100)`, according to Lightcast. These losses have fallen almost entirely on younger workers. Between 2023 and 2025, employment of workers ages 22–24 in the industry in Colorado fell `r pct_ab(chg_2224)` and employment of workers ages 25–34 fell `r pct_ab(chg_2534)`, while employment of workers 55 and older was essentially unchanged, according to the U.S. Census Bureau’s Quarterly Workforce Indicators. Across all Colorado industries, employment in both younger age groups was roughly flat. The decline reflects reduced hiring rather than layoffs: separation rates for younger workers held steady, while expanding firms added `r pct_ab(fjg_2534_chg, 0)` fewer positions for workers ages 25–34 between 2022 and 2024. Job postings also show a shift in what firms are hiring for. Of the `r num(post_total)` unique postings by Colorado accounting and payroll firms between October 2025 and September 2026, `r pct(post_cm / post_total)` were for computer and mathematical occupations, compared with `r pct(post_acct / post_total)` for accountants and auditors, and `r pct(post_ai / post_total)` listed artificial intelligence as a skill, according to Lightcast.
+
+Offices of certified public accountants (CPAs), the industry’s largest component, account for most of the recent decline. First-quarter 2026 employment at CPA offices fell `r pct_ab(q1chg_cpa)` year-over-year even as the number of firms rose `r pct(q1chg_cpa_est)`, a pattern consistent with consolidation and the automation of entry-level work. Roughly a quarter of the nation’s 100 largest CPA firms are now backed by private equity, including Denver-based Richey May (“Accounting Enters Its Private Equity Flip Era,” CFO Brew, April 30, 2026). National research finds that employment among workers ages 22–25 in the occupations most exposed to AI, including accountants, is now 19% below where it would be had it kept pace with less-exposed workers (“Canaries in the Coal Mine? Six Facts about the Recent Employment Effects of Artificial Intelligence,” Erik Brynjolfsson, Bharat Chandar, and Ruyu Chen, Stanford Digital Economy Lab, revised August 12, 2026). Long-term demand remains solid. According to the Colorado Workforce Development Council’s 2025 Colorado Talent Pipeline Report, accountants and auditors are a Tier 1 Top Job with an estimated 3,793 openings annually through 2034. Beginning January 1, 2027, SB26-076 will allow candidates to qualify for CPA certification with a bachelor’s degree and two years of experience as an alternative to the 150-credit-hour requirement.
+
+Payroll services has followed a different path. Colorado employment in the subsector grew `r pct(cagr_pay_co)` annually from 2015 to 2025, more than double the national rate, and rose `r pct(chg25_pay)` in 2025 to `r num(pay_emp_25)` workers, though first-quarter 2026 employment was down `r pct_ab(q1chg_pay)` from a year earlier. The industry is consolidating around large software platforms, as shown by Paychex’s $4.1 billion acquisition of Paycor, and automation is reducing the need for routine processing. Payroll technology companies were among the industry’s most active hirers: UKG, Gusto, and ADP together posted `r nearly(post_paytech)` Colorado jobs between October 2025 and September 2026, according to Lightcast. Colorado employment of payroll and timekeeping clerks is projected to decline `r pct_ab(pay_clerk_chg, 0)` between 2025 and 2035, according to long-term occupational projections from the Colorado Department of Labor and Employment.
+
+Sources: Lightcast Q4 2026 industry and job postings data; U.S. Bureau of Labor Statistics, [Quarterly Census of Employment and Wages](https://www.bls.gov/cew/); U.S. Census Bureau, [Quarterly Workforce Indicators](https://lehd.ces.census.gov/data/#qwi); Colorado Workforce Development Council, [2025 Colorado Talent Pipeline Report](https://cwdc.colorado.gov/resources/colorado-talent-pipeline-report); [Colorado Senate Bill 26-076](https://leg.colorado.gov/bills/SB26-076); Colorado Department of Labor and Employment, [2025–2035 long-term occupational projections](https://cdle.colorado.gov/dlss/labor-market-information-lmi/industry-and-occupational-projections); [CFO Brew](https://www.cfobrew.com/stories/2026/04/30/accounting-enters-its-private-equity-flip-era) on private equity in accounting; [Stanford Digital Economy Lab](https://digitaleconomy.stanford.edu/publications/canaries-in-the-coal-mine/) on AI and early-career employment; [Constellation Research](https://www.constellationr.com/insights/news/paychex-acquires-paycor-41-billion-deal) on the Paychex–Paycor acquisition.
+
+---
+
+## Audit table {#audit-table}
+
+**Wording checks:** these rows compare a value against the wording the text uses, for example "more than double" or "essentially unchanged". Every check flagged "REVIEW" should be looked at before publishing.
+
+```{r audit}
+check <- function(ok) ifelse(ok, "ok", "REVIEW")
+audit <- data.frame(
+  claim = c("5412 CAGR 2015-25", "Colorado overall CAGR 2015-25", "PST CAGR 2015-25",
+            "5412 change 2024-25", "5412 employment 2025", "PST change 2024-25", "Colorado change 2024-25",
+            "5412 Q1 2026 vs Q1 2025", "Earnings per job change 2025 (Lightcast)", "Earnings per job 2025 (Lightcast)",
+            "Employment 22-24 change 2023-25", "Employment 25-34 change 2023-25",
+            "Employment 55+ change 2023-25 ('essentially unchanged')",
+            "All industries 22-24 / 25-34 change ('roughly flat')",
+            "Separation rate 22-24 ('held steady')", "Separation rate 25-34 ('held steady')",
+            "Firm job gains 25-34 change 2022-24",
+            "Postings total", "Computer & math share of postings", "Accountants & auditors share", "AI skill share",
+            "CPA offices: largest component (share of 5412, 2025)", "CPA offices: share of Q1 job loss ('most')",
+            "CPA offices Q1 employment change", "CPA offices Q1 establishments change",
+            "Payroll CAGR Colorado 2015-25", "Payroll CO/US growth ratio ('more than double')",
+            "Payroll change 2024-25", "Payroll employment 2025", "Payroll Q1 2026 change",
+            "UKG + Gusto + ADP postings ('nearly 600')", "Payroll clerks projected change 2025-35"),
+  value = c(pct(cagr_5412), pct(cagr_co), pct(cagr_pst),
+            pct(chg25_5412), num(e5412_25), pct(chg25_pst), pct(chg25_co),
+            pct(q1chg_5412), pct(earn_chg), usd(earn_25),
+            pct(chg_2224), pct(chg_2534), pct(chg_55p),
+            paste(pct(chg_2224_all), "/", pct(chg_2534_all)),
+            paste(pct(sep_2224_23), "to", pct(sep_2224_25)), paste(pct(sep_2534_23), "to", pct(sep_2534_25)),
+            pct(fjg_2534_chg),
+            num(post_total), pct(post_cm / post_total), pct(post_acct / post_total), pct(post_ai / post_total),
+            pct(cpa_share_25), pct(cpa_share_of_q1_loss),
+            pct(q1chg_cpa), pct(q1chg_cpa_est),
+            pct(cagr_pay_co), sprintf("%.2fx", pay_ratio),
+            pct(chg25_pay), num(pay_emp_25), pct(q1chg_pay),
+            num(post_paytech), pct(pay_clerk_chg)),
+  check = c(rep("", 12),
+            check(abs(chg_55p) < 0.02),
+            check(abs(chg_2224_all) < 0.02 & abs(chg_2534_all) < 0.02),
+            check(abs(sep_2224_25 - sep_2224_23) < 0.01), check(abs(sep_2534_25 - sep_2534_23) < 0.01),
+            "", "", "", "", "",
+            check(cpa_share_25 > 0.5), check(cpa_share_of_q1_loss > 0.5),
+            "", "", "", check(pay_ratio > 2), "", "", "",
+            check(post_paytech < 600 & post_paytech >= 550), ""),
+  source = c(rep("QCEW annual (qcew-annual chunk)", 7), "QCEW Q1 (qcew-q1)", rep("Lightcast industry table (lightcast)", 2),
+             rep("QWI (qwi)", 7), rep("Lightcast postings (lightcast)", 4),
+             "QCEW annual (qcew-annual)", rep("QCEW Q1 (qcew-q1)", 3),
+             rep("QCEW industry file 541214 (payroll-us)", 4), "QCEW Q1 (qcew-q1)",
+             "Lightcast postings (lightcast)", "CDLE LMI 2025-35 (lmi)"))
+audit
+```
+
+```{r session}
+#| code-fold: true
+sessionInfo()
+```
